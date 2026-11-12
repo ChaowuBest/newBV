@@ -196,6 +196,35 @@ class CdnSelectorTest {
             assertThat(selector.rank(listOf(slow, fast)).first()).isEqualTo(fast)
         }
 
+    @Test
+    fun `rank forgives and probes again when every candidate is penalized`() =
+        runTest {
+            // Given: 两个节点同时被标记故障（多半是本机网络抖动，而不是节点的问题）
+            val selector = selector()
+            selector.rank(listOf(fast, slow))
+            selector.reportFailure(fast)
+            selector.reportFailure(slow)
+
+            // When
+            val ranked = selector.rank(listOf(slow, fast))
+
+            // Then: 解除标记并重新测速，而不是在惩罚期内一直按接口顺序盲选
+            assertThat(ranked).containsExactly(fast, slow).inOrder()
+            assertThat(hitsOf("fast.example")).isEqualTo(2)
+            assertThat(selector.speedOf(fast)).isGreaterThan(0L)
+        }
+
+    @Test
+    fun `rank forgives a penalized single candidate`() =
+        runTest {
+            val selector = selector()
+            selector.reportFailure(fast)
+
+            assertThat(selector.rank(listOf(fast))).containsExactly(fast)
+            // 唯一的候选不再显示为「异常」
+            assertThat(selector.speedOf(fast)).isEqualTo(-1L)
+        }
+
     // ── deprioritizeFailed ──────────────────────────────────
 
     @Test
@@ -216,6 +245,18 @@ class CdnSelectorTest {
         assertThat(selector.deprioritizeFailed(listOf(slow, fast, dead)))
             .containsExactly(fast, dead, slow)
             .inOrder()
+    }
+
+    @Test
+    fun `deprioritizeFailed forgives when every candidate is penalized`() {
+        val selector = selector()
+        selector.reportFailure(slow)
+        selector.reportFailure(fast)
+
+        assertThat(selector.deprioritizeFailed(listOf(slow, fast)))
+            .containsExactly(slow, fast)
+            .inOrder()
+        assertThat(selector.speedOf(slow)).isEqualTo(-1L)
     }
 
     // ── speedOf ─────────────────────────────────────────────

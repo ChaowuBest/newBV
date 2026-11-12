@@ -29,7 +29,8 @@ interface CdnSelector {
      *   后台静默重测（下次播放生效），不增加起播等待；
      * - 没有可用缓存的 host 并发做小流量测速（阻塞本次调用，有超时上限）；
      * - 吞吐接近最优者（同一档）保持入参顺序，避免测速抖动造成无意义的换源；
-     * - 测速失败、被 [reportFailure] / [reportSlow] 标记的 host 排在最后。
+     * - 测速失败、被 [reportFailure] / [reportSlow] 标记的 host 排在最后；
+     * - 候选全部被标记时视为本机网络抖动，解除标记后重新测速。
      *
      * @param urls 候选播放地址（同一视频/音频轨道的 base + backup 列表）。
      * @return 排序后的地址列表；入参为空时返回空列表。
@@ -38,7 +39,8 @@ interface CdnSelector {
 
     /**
      * 不发起任何网络请求，仅依据已知的故障标记调整顺序：被标记的 host 排到最后，
-     * 其余保持入参顺序。用于未开启测速选源时的失败回退。
+     * 其余保持入参顺序（候选全部被标记时解除标记、保持入参顺序）。
+     * 用于未开启测速选源时的失败回退。
      *
      * @param urls 候选播放地址。
      * @return 调整顺序后的地址列表（已去重、去空白）。
@@ -205,11 +207,11 @@ class OkHttpCdnSelector(
 
     override suspend fun rank(urls: List<String>): List<String> {
         val candidates = normalize(urls)
-        if (candidates.size <= 1) return candidates
-
         val now = clock()
         // 同一 host 只测一次：取该 host 的第一个地址作代表
         val byHost = candidates.groupBy { hostOf(it) }.mapValues { it.value.first() }
+        forgiveIfAllPenalized(byHost.keys, now)
+        if (candidates.size <= 1) return candidates
 
         val needProbe = mutableListOf<String>()
         val needRefresh = mutableListOf<String>()
@@ -249,8 +251,9 @@ class OkHttpCdnSelector(
 
     override fun deprioritizeFailed(urls: List<String>): List<String> {
         val candidates = normalize(urls)
-        if (candidates.size <= 1) return candidates
         val now = clock()
+        forgiveIfAllPenalized(candidates.map { hostOf(it) }.toSet(), now)
+        if (candidates.size <= 1) return candidates
         // 稳定排序：未被惩罚的保持入参顺序在前，被惩罚的保持相对顺序在后
         return candidates.sortedBy { url ->
             val state = stateOfHost(hostOf(url))
@@ -286,6 +289,23 @@ class OkHttpCdnSelector(
                     measuredAtMs = 0L,
                     penalizedUntilMs = maxOf(until, hostStates[host]?.penalizedUntilMs ?: 0L),
                 )
+        }
+    }
+
+    /**
+     * 候选节点全部处于惩罚期时，解除它们的惩罚（连同作废的测速记录一并清掉）。
+     *
+     * 所有节点同时出故障，多半是本机网络抖动（断网、切换 Wi-Fi）而不是节点的问题：
+     * 此时惩罚提供不了任何排序信息，反而会让接下来的一段时间无法重新测速。
+     */
+    private fun forgiveIfAllPenalized(
+        hosts: Collection<String>,
+        now: Long,
+    ) {
+        if (hosts.isEmpty()) return
+        synchronized(lock) {
+            val allPenalized = hosts.all { (hostStates[it]?.penalizedUntilMs ?: 0L) > now }
+            if (allPenalized) hosts.forEach { hostStates.remove(it) }
         }
     }
 

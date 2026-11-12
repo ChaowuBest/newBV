@@ -18,6 +18,11 @@ localProperties.apply {
     }
 }
 
+// 自行构建的包可与官方包并存：通过 Gradle 属性追加包名后缀 / 改桌面名称，默认不改。
+// 例：./gradlew assembleRelease -Pnewbv.appIdSuffix=.cdn -Pnewbv.appLabel="new BV CDN"
+val customAppIdSuffix = providers.gradleProperty("newbv.appIdSuffix").orNull
+val customAppLabel = providers.gradleProperty("newbv.appLabel").orNull
+
 val signingPropertiesFile = rootProject.file("signing.properties")
 val signingProperties = Properties()
 if (signingPropertiesFile.exists()) {
@@ -56,6 +61,8 @@ android {
             "CRASH_REPORT_TOKEN",
             "\"${localProperties.getProperty("crashReport.token", "")}\"",
         )
+
+        manifestPlaceholders["appLabel"] = customAppLabel ?: "@string/app_name"
     }
 
     buildTypes {
@@ -69,6 +76,7 @@ android {
             if (signingPropertiesFile.exists()) {
                 signingConfig = signingConfigs.getByName("release")
             }
+            customAppIdSuffix?.let { applicationIdSuffix = it }
         }
         debug {
             isMinifyEnabled = false

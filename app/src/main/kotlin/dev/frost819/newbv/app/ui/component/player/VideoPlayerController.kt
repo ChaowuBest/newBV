@@ -596,6 +596,7 @@ fun VideoPlayerController(
                 onAspectRatioChange = onAspectRatioChange,
                 onPlaySpeedChange = onPlaySpeedChange,
                 onAudioChange = { onMediaProfileSettingChange(MediaProfileSettingAction.SetAudio(it)) },
+                onCdnLineChange = { onMediaProfileSettingChange(MediaProfileSettingAction.SetCdnLine(it)) },
                 onDanmakuSwitchChange = { types ->
                     // data DanmakuType → danmaku entity DanmakuType
                     val entityTypes =

@@ -135,7 +135,7 @@ fun BufferingTip(modifier: Modifier = Modifier) {
 /**
  * 播放错误提示。
  *
- * 屏幕中央显示半透明错误框：标题 + 具体错误信息。
+ * 屏幕中央显示半透明错误框：标题 + 具体错误信息 + 重试方式。
  *
  * @param errorMessage 错误信息
  */
@@ -162,6 +162,8 @@ fun PlayErrorTip(
             )
             Spacer(modifier = Modifier.height(12.dp))
             Text(text = "错误信息：$errorMessage")
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(text = "按确认键重试，或在菜单「画质设置 → 线路」中手动切换")
         }
     }
 }

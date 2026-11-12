@@ -106,6 +106,10 @@ class PlayerViewModelTest {
         favoriteRepository = mockk(relaxed = true)
         oneClickTripleActionRepository = mockk(relaxed = true)
         cdnSelector = mockk(relaxed = true)
+        // 选择器默认「原样返回」：relaxed mock 返回的 List 是 mock 而非真实列表
+        coEvery { cdnSelector.rank(any()) } answers { firstArg() }
+        every { cdnSelector.deprioritizeFailed(any()) } answers { firstArg() }
+        every { cdnSelector.speedOf(any()) } returns -1L
 
         mockkObject(Prefs)
         every { Prefs.apiType } returns DataApiType.Web
@@ -1069,34 +1073,388 @@ class PlayerViewModelTest {
         }
 
     @Test
-    fun `onError sets error when no remaining CDN candidate`() =
+    fun `onError falls back to next CDN candidate even when autoSelectCdn disabled`() =
         runTest(testDispatcher) {
+            // 失败回退不受「测速选源」开关影响：备用地址本来就该在出错时用上
             setVideoPlayer(mockPlayer)
-            every { Prefs.autoSelectCdn } returns true
+            every { Prefs.autoSelectCdn } returns false
+            every { mockPlayer.currentPosition } returns 5000L
             setCdnCandidates(
-                video = listOf("https://cdn1.example/v.m4s"),
-                audio = emptyList(),
+                video = listOf("https://cdn1.example/v.m4s", "https://cdn2.example/v.m4s"),
+                audio = listOf("https://cdn1.example/a.m4s", "https://cdn2.example/a.m4s"),
             )
 
-            getVideoPlayerListener().onError(IOException("boom"))
+            getVideoPlayerListener().onError(IOException("source error"))
 
+            // 分不清是哪条流出的错：音视频一起换到下一条
+            verify { mockPlayer.playUrl("https://cdn2.example/v.m4s", "https://cdn2.example/a.m4s") }
+            verify { mockPlayer.seekTo(5000L) }
+            assertThat(viewModel.uiState.value.cdnLineIndex).isEqualTo(1)
+        }
+
+    @Test
+    fun `onError refetches play data and resumes when CDN candidates are exhausted`() =
+        runTest(testDispatcher) {
+            // Given: 只剩一条线路，且它出错了
+            setVideoPlayer(mockPlayer)
+            every { mockPlayer.currentPosition } returns 42_000L
+            setPlayData(
+                PlayData(
+                    dashVideos = listOf(dashVideo(80, 7, "avc1.640034")),
+                    dashAudios = listOf(dashAudio(30280)),
+                ),
+            )
+            setCdnCandidates(video = listOf("https://old.example/v.m4s"), audio = emptyList())
+            coEvery { videoPlayRepository.getPlayData(any(), any(), any()) } returns
+                PlayData(
+                    dashVideos =
+                        listOf(dashVideo(80, 7, "avc1.640034").copy(baseUrl = "https://fresh.example/v.m4s")),
+                    dashAudios = listOf(dashAudio(30280).copy(baseUrl = "https://fresh.example/a.m4s")),
+                )
+
+            // When
+            getVideoPlayerListener().onError(IOException("boom"))
+            // 重拉期间先进入加载态，不闪现错误
+            assertThat(viewModel.uiState.value.playerState).isNotInstanceOf(PlayerState.Error::class.java)
+            assertThat(viewModel.uiState.value.isBuffering).isTrue()
+            advanceUntilIdle()
+
+            // Then: 用新一批地址从出错位置续播
+            coVerify(exactly = 1) { videoPlayRepository.getPlayData(any(), any(), any()) }
+            verify { mockPlayer.playUrl("https://fresh.example/v.m4s", "https://fresh.example/a.m4s") }
+            verify { mockPlayer.seekTo(42_000L) }
+            assertThat(viewModel.uiState.value.playerState).isNotInstanceOf(PlayerState.Error::class.java)
+        }
+
+    @Test
+    fun `onError refetches only once per episode then reports error`() =
+        runTest(testDispatcher) {
+            setVideoPlayer(mockPlayer)
+            setPlayData(
+                PlayData(
+                    dashVideos = listOf(dashVideo(80, 7, "avc1.640034")),
+                    dashAudios = emptyList(),
+                ),
+            )
+            setCdnCandidates(video = listOf("https://old.example/v.m4s"), audio = emptyList())
+            coEvery { videoPlayRepository.getPlayData(any(), any(), any()) } returns
+                PlayData(
+                    dashVideos = listOf(dashVideo(80, 7, "avc1.640034")),
+                    dashAudios = emptyList(),
+                )
+
+            // 第一次出错：重拉地址
+            getVideoPlayerListener().onError(IOException("boom"))
+            advanceUntilIdle()
+            // 新地址紧接着又出错：不再重拉，直接报错
+            getVideoPlayerListener().onError(IOException("boom again"))
+            advanceUntilIdle()
+
+            coVerify(exactly = 1) { videoPlayRepository.getPlayData(any(), any(), any()) }
             assertThat(viewModel.uiState.value.playerState).isInstanceOf(PlayerState.Error::class.java)
         }
 
     @Test
-    fun `onError sets error when autoSelectCdn disabled`() =
+    fun `onError reports load failure when play data cannot be refetched`() =
         runTest(testDispatcher) {
             setVideoPlayer(mockPlayer)
-            every { Prefs.autoSelectCdn } returns false
+            setPlayData(
+                PlayData(
+                    dashVideos = listOf(dashVideo(80, 7, "avc1.640034")),
+                    dashAudios = emptyList(),
+                ),
+            )
+            setCdnCandidates(video = listOf("https://cdn1.example/v.m4s"), audio = emptyList())
+            coEvery { videoPlayRepository.getPlayData(any(), any(), any()) } throws IOException("network down")
+
+            getVideoPlayerListener().onError(IOException("boom"))
+            advanceUntilIdle()
+
+            val state = viewModel.uiState.value
+            assertThat(state.playerState).isInstanceOf(PlayerState.Error::class.java)
+            assertThat((state.playerState as PlayerState.Error).message).isEqualTo("网络异常，请检查网络后重试")
+            assertThat(state.isBuffering).isFalse()
+        }
+
+    @Test
+    fun `onError skips remaining candidates and refetches when play urls are expired`() =
+        runTest(testDispatcher) {
+            // Given: 当前这批地址已过期（deadline 是秒级时间戳，1 即早已过期），还有未试过的备用线路
+            setVideoPlayer(mockPlayer)
+            setPlayData(
+                PlayData(
+                    dashVideos = listOf(dashVideo(80, 7, "avc1.640034")),
+                    dashAudios = emptyList(),
+                ),
+            )
+            setCdnCandidates(
+                video =
+                    listOf(
+                        "https://cdn1.example/v.m4s?deadline=1&x=1",
+                        "https://cdn2.example/v.m4s?deadline=1&x=1",
+                    ),
+                audio = emptyList(),
+            )
+            coEvery { videoPlayRepository.getPlayData(any(), any(), any()) } returns
+                PlayData(
+                    dashVideos =
+                        listOf(dashVideo(80, 7, "avc1.640034").copy(baseUrl = "https://fresh.example/v.m4s")),
+                    dashAudios = emptyList(),
+                )
+
+            // When
+            getVideoPlayerListener().onError(IOException("403"))
+            advanceUntilIdle()
+
+            // Then: 同批地址共用过期时间，不去试 cdn2，直接换一批新的
+            verify(exactly = 0) { mockPlayer.playUrl("https://cdn2.example/v.m4s?deadline=1&x=1", any()) }
+            verify { mockPlayer.playUrl("https://fresh.example/v.m4s", any()) }
+        }
+
+    @Test
+    fun `onError reports out of memory without switching line`() =
+        runTest(testDispatcher) {
+            setVideoPlayer(mockPlayer)
             setCdnCandidates(
                 video = listOf("https://cdn1.example/v.m4s", "https://cdn2.example/v.m4s"),
                 audio = emptyList(),
             )
 
-            getVideoPlayerListener().onError(RuntimeException("boom"))
+            // media3 加载线程的 OOM 会被包装成 IOException，表面上是 Source error
+            getVideoPlayerListener().onError(IOException("Unexpected OutOfMemoryError", OutOfMemoryError()))
 
             verify(exactly = 0) { mockPlayer.playUrl(any(), any()) }
-            assertThat(viewModel.uiState.value.playerState).isInstanceOf(PlayerState.Error::class.java)
+            val state = viewModel.uiState.value.playerState
+            assertThat(state).isInstanceOf(PlayerState.Error::class.java)
+            assertThat((state as PlayerState.Error).message).contains("内存不足")
+        }
+
+    @Test
+    fun `onError does not mark any line when failed url is unknown`() =
+        runTest(testDispatcher) {
+            setVideoPlayer(mockPlayer)
+            setCdnCandidates(
+                video = listOf("https://cdn1.example/v.m4s", "https://cdn2.example/v.m4s"),
+                audio = emptyList(),
+            )
+
+            // 异常里拿不到失败地址时不乱标记
+            getVideoPlayerListener().onError(IOException("boom"))
+
+            verify(exactly = 0) { cdnSelector.reportFailure(any()) }
+        }
+
+    // ── 错误态重试 ────────────────────────────────────────────
+
+    @Test
+    fun `togglePlayPause in error state refetches play data and resumes`() =
+        runTest(testDispatcher) {
+            // Given: 已出错，播放器停在 42 秒
+            setVideoPlayer(mockPlayer)
+            every { mockPlayer.currentPosition } returns 42_000L
+            setPlayData(
+                PlayData(
+                    dashVideos = listOf(dashVideo(80, 7, "avc1.640034")),
+                    dashAudios = emptyList(),
+                ),
+            )
+            updateUiState { it.copy(playerState = PlayerState.Error("网络异常")) }
+            coEvery { videoPlayRepository.getPlayData(any(), any(), any()) } returns
+                PlayData(
+                    dashVideos =
+                        listOf(dashVideo(80, 7, "avc1.640034").copy(baseUrl = "https://fresh.example/v.m4s")),
+                    dashAudios = emptyList(),
+                )
+
+            // When: 按播放 / 确认键
+            viewModel.togglePlayPause()
+            advanceUntilIdle()
+
+            // Then: 不是单纯 start()（对已出错的播放器无效），而是换新地址重新加载
+            verify { mockPlayer.playUrl("https://fresh.example/v.m4s", any()) }
+            verify { mockPlayer.prepare() }
+            verify { mockPlayer.seekTo(42_000L) }
+            assertThat(viewModel.uiState.value.playerState).isNotInstanceOf(PlayerState.Error::class.java)
+        }
+
+    @Test
+    fun `updateMediaProfile in error state refetches play data before switching`() =
+        runTest(testDispatcher) {
+            // Given: 出错后缓存的那批地址很可能整体失效
+            setVideoPlayer(mockPlayer)
+            setPlayData(
+                PlayData(
+                    dashVideos =
+                        listOf(
+                            dashVideo(80, 7, "avc1.640034"),
+                            dashVideo(64, 7, "avc1.64001F"),
+                        ),
+                    dashAudios = emptyList(),
+                ),
+            )
+            updateUiState { it.copy(playerState = PlayerState.Error("网络异常")) }
+            coEvery { videoPlayRepository.getPlayData(any(), any(), any()) } returns
+                PlayData(
+                    dashVideos =
+                        listOf(
+                            dashVideo(80, 7, "avc1.640034").copy(baseUrl = "https://fresh.example/80.m4s"),
+                            dashVideo(64, 7, "avc1.64001F").copy(baseUrl = "https://fresh.example/64.m4s"),
+                        ),
+                    dashAudios = emptyList(),
+                )
+
+            // When: 降画质
+            viewModel.updateMediaProfile(MediaProfileSettingAction.SetQuality(64))
+            advanceUntilIdle()
+
+            // Then: 用的是新一批地址里的 720P，而不是旧批次
+            verify { mockPlayer.playUrl("https://fresh.example/64.m4s", any()) }
+        }
+
+    // ── 手动线路 ──────────────────────────────────────────────
+
+    @Test
+    fun `SetCdnLine switches to chosen line and audio follows same host`() =
+        runTest(testDispatcher) {
+            setVideoPlayer(mockPlayer)
+            every { mockPlayer.currentPosition } returns 9000L
+            setCdnCandidates(
+                video = listOf("https://cdn1.example/v.m4s", "https://cdn2.example/v.m4s"),
+                audio = listOf("https://cdn1.example/a.m4s", "https://cdn2.example/a.m4s"),
+            )
+
+            viewModel.updateMediaProfile(MediaProfileSettingAction.SetCdnLine(1))
+
+            verify { mockPlayer.playUrl("https://cdn2.example/v.m4s", "https://cdn2.example/a.m4s") }
+            verify { mockPlayer.seekTo(9000L) }
+            assertThat(viewModel.uiState.value.cdnLineIndex).isEqualTo(1)
+        }
+
+    @Test
+    fun `SetCdnLine ignores current line and out of range index`() =
+        runTest(testDispatcher) {
+            setVideoPlayer(mockPlayer)
+            setCdnCandidates(
+                video = listOf("https://cdn1.example/v.m4s", "https://cdn2.example/v.m4s"),
+                audio = emptyList(),
+            )
+
+            viewModel.updateMediaProfile(MediaProfileSettingAction.SetCdnLine(0))
+            viewModel.updateMediaProfile(MediaProfileSettingAction.SetCdnLine(5))
+
+            verify(exactly = 0) { mockPlayer.playUrl(any(), any()) }
+        }
+
+    // ── 卡顿看门狗 ────────────────────────────────────────────
+
+    @Test
+    fun `stall watchdog switches line when buffering makes no progress`() =
+        runTest(testDispatcher) {
+            // Given: 正在缓冲、用户希望播放，但缓冲位置纹丝不动
+            setVideoPlayer(mockPlayer)
+            every { mockPlayer.isPlayRequested } returns true
+            every { mockPlayer.bufferedPosition } returns 30_000L
+            every { mockPlayer.currentPosition } returns 30_000L
+            setCdnCandidates(
+                video = listOf("https://cdn1.example/v.m4s", "https://cdn2.example/v.m4s"),
+                audio = listOf("https://cdn1.example/a.m4s"),
+            )
+
+            // When: 缓冲持续超过一个观察周期
+            getVideoPlayerListener().onBuffering()
+            advanceTimeBy(12_500L)
+            runCurrent()
+
+            // Then: 标记当前线路并切到下一条，音频不动
+            verify { cdnSelector.reportSlow("https://cdn1.example/v.m4s") }
+            verify { mockPlayer.playUrl("https://cdn2.example/v.m4s", "https://cdn1.example/a.m4s") }
+            verify { mockPlayer.seekTo(30_000L) }
+        }
+
+    @Test
+    fun `stall watchdog moves audio along when it shares the stalled host`() =
+        runTest(testDispatcher) {
+            // Given: 音视频在同一节点上，缓冲纹丝不动（卡住的可能正是音频）
+            setVideoPlayer(mockPlayer)
+            every { mockPlayer.isPlayRequested } returns true
+            every { mockPlayer.bufferedPosition } returns 30_000L
+            every { mockPlayer.currentPosition } returns 30_000L
+            setCdnCandidates(
+                video = listOf("https://cdn1.example/v.m4s", "https://cdn2.example/v.m4s"),
+                audio = listOf("https://cdn1.example/a.m4s", "https://cdn2.example/a.m4s"),
+            )
+
+            // When
+            getVideoPlayerListener().onBuffering()
+            advanceTimeBy(12_500L)
+            runCurrent()
+
+            // Then: 音频跟着视频一起离开塌陷的节点
+            verify { mockPlayer.playUrl("https://cdn2.example/v.m4s", "https://cdn2.example/a.m4s") }
+        }
+
+    @Test
+    fun `stall watchdog keeps line while buffering still progresses`() =
+        runTest(testDispatcher) {
+            // Given: 只是网速慢，缓冲仍在推进
+            setVideoPlayer(mockPlayer)
+            every { mockPlayer.isPlayRequested } returns true
+            var buffered = 30_000L
+            every { mockPlayer.bufferedPosition } answers { buffered.also { buffered += 5_000L } }
+            setCdnCandidates(
+                video = listOf("https://cdn1.example/v.m4s", "https://cdn2.example/v.m4s"),
+                audio = emptyList(),
+            )
+
+            getVideoPlayerListener().onBuffering()
+            advanceTimeBy(12_500L)
+            runCurrent()
+
+            // Then: 换线路会白丢已缓冲数据，不换
+            verify(exactly = 0) { mockPlayer.playUrl(any(), any()) }
+            verify(exactly = 0) { cdnSelector.reportSlow(any()) }
+
+            // 缓冲一直在推进时看门狗会一直观察下去：显式取消，
+            // 否则 runTest 收尾时会沿虚拟时间无限推进（见 AGENTS.md 11.5.4）
+            viewModel.viewModelScope.cancel()
+        }
+
+    @Test
+    fun `stall watchdog stops once playback is ready`() =
+        runTest(testDispatcher) {
+            setVideoPlayer(mockPlayer)
+            every { mockPlayer.isPlayRequested } returns true
+            every { mockPlayer.bufferedPosition } returns 30_000L
+            setCdnCandidates(
+                video = listOf("https://cdn1.example/v.m4s", "https://cdn2.example/v.m4s"),
+                audio = emptyList(),
+            )
+
+            getVideoPlayerListener().onBuffering()
+            advanceTimeBy(5_000L)
+            getVideoPlayerListener().onPlay()
+            advanceTimeBy(20_000L)
+            runCurrent()
+
+            verify(exactly = 0) { mockPlayer.playUrl(any(), any()) }
+        }
+
+    @Test
+    fun `stall watchdog ignores buffering while user paused`() =
+        runTest(testDispatcher) {
+            setVideoPlayer(mockPlayer)
+            every { mockPlayer.isPlayRequested } returns false
+            every { mockPlayer.bufferedPosition } returns 30_000L
+            setCdnCandidates(
+                video = listOf("https://cdn1.example/v.m4s", "https://cdn2.example/v.m4s"),
+                audio = emptyList(),
+            )
+
+            getVideoPlayerListener().onBuffering()
+            advanceTimeBy(30_000L)
+            runCurrent()
+
+            verify(exactly = 0) { mockPlayer.playUrl(any(), any()) }
         }
 
     @Test

@@ -23,6 +23,7 @@ import androidx.media3.exoplayer.mediacodec.MediaCodecUtil
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.MergingMediaSource
+import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import androidx.media3.exoplayer.upstream.ParsingLoadable
 import dev.frost819.newbv.player.AbstractVideoPlayer
 import dev.frost819.newbv.player.VideoPlayerOptions
@@ -60,6 +61,15 @@ class ExoMediaPlayer(
         private const val BEHIND_LIVE_WINDOW_RECOVER_WINDOW_MS = 15_000L
         private const val BEHIND_LIVE_WINDOW_RECOVER_MIN_INTERVAL_MS = 1_200L
         private const val BEHIND_LIVE_WINDOW_MAX_RECOVERS = 2
+
+        /**
+         * 点播（音视频分离的 DASH）单个地址的原地重试次数。
+         *
+         * media3 默认对同一地址重试 3 次才上报错误，节点不通时要白等几十秒。
+         * 点播有多条候选线路，上层会在出错后换线路 / 重新获取地址，因此原地只重试 1 次，
+         * 尽快把错误交给上层处理。
+         */
+        private const val VOD_MIN_LOADABLE_RETRY_COUNT = 1
     }
 
     /** ExoPlayer 实例，在 [initPlayer] 中创建 */
@@ -136,8 +146,10 @@ class ExoMediaPlayer(
         audioUrl: String?,
     ) {
         streamProtocol = resolveStreamProtocol(videoUrl, audioUrl)
-        val videoMediaSource = videoUrl?.let { createMediaSource(it) }
-        val audioMediaSource = audioUrl?.let { createMediaSource(it) }
+        // 音视频分离即点播 DASH：有多条候选线路可换，原地少重试、快失败
+        val failFast = videoUrl != null && audioUrl != null
+        val videoMediaSource = videoUrl?.let { createMediaSource(it, failFast) }
+        val audioMediaSource = audioUrl?.let { createMediaSource(it, failFast) }
 
         val mediaSources = listOfNotNull(videoMediaSource, audioMediaSource)
         mMediaSource =
@@ -178,8 +190,15 @@ class ExoMediaPlayer(
      * 会导致 ExoPlayer 错误计算直播窗口位置，触发 `ERROR_CODE_BEHIND_LIVE_WINDOW`。
      * 因此对 `.m3u8` URL 使用 [HlsMediaSource] 并通过自定义 [HlsPlaylistParserFactory]
      * 剥离该标签；其余格式（DASH / FLV / progressive）走 [DefaultMediaSourceFactory]。
+     *
+     * @param url 媒体地址
+     * @param failFast 是否减少同一地址的原地重试次数（见 [VOD_MIN_LOADABLE_RETRY_COUNT]）；
+     *   直播流只有一个地址，保持 media3 默认的重试策略
      */
-    private fun createMediaSource(url: String): MediaSource {
+    private fun createMediaSource(
+        url: String,
+        failFast: Boolean = false,
+    ): MediaSource {
         val isHls =
             url
                 .substringBefore('?')
@@ -193,7 +212,13 @@ class ExoMediaPlayer(
                 .createMediaSource(MediaItem.fromUri(url))
         } else {
             DefaultMediaSourceFactory(dataSourceFactory)
-                .createMediaSource(MediaItem.fromUri(url))
+                .apply {
+                    if (failFast) {
+                        setLoadErrorHandlingPolicy(
+                            DefaultLoadErrorHandlingPolicy(VOD_MIN_LOADABLE_RETRY_COUNT),
+                        )
+                    }
+                }.createMediaSource(MediaItem.fromUri(url))
         }
     }
 
@@ -237,6 +262,10 @@ class ExoMediaPlayer(
         get() = mPlayer?.duration ?: 0
     override val bufferedPercentage: Int
         get() = mPlayer?.bufferedPercentage ?: 0
+    override val bufferedPosition: Long
+        get() = mPlayer?.bufferedPosition ?: 0
+    override val isPlayRequested: Boolean
+        get() = mPlayer?.playWhenReady == true
 
     override fun setOptions() {
         mPlayer?.playWhenReady = true

@@ -88,4 +88,13 @@ sealed interface MediaProfileSettingAction {
     data class SetAudio(
         val audio: Audio,
     ) : MediaProfileSettingAction
+
+    /**
+     * 手动切换视频线路（CDN 节点）。
+     *
+     * @param index 目标线路在 `PlayerUiState.cdnLines` 中的下标
+     */
+    data class SetCdnLine(
+        val index: Int,
+    ) : MediaProfileSettingAction
 }

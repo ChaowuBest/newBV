@@ -49,6 +49,10 @@ data class PlayerUiState(
     val availableQuality: Map<Int, String> = emptyMap(),
     val availableVideoCodec: List<VideoCodec> = emptyList(),
     val availableAudio: List<Audio> = emptyList(),
+    /** 当前视频流的候选线路（展示文案，已按推荐顺序排列）。 */
+    val cdnLines: List<String> = emptyList(),
+    /** 当前使用的线路在 [cdnLines] 中的下标。 */
+    val cdnLineIndex: Int = 0,
     // 当前选中状态
     val mediaProfileState: MediaProfileState = MediaProfileState(),
     val playSpeed: Float = 1f,

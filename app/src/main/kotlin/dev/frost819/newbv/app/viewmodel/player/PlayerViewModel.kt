@@ -21,10 +21,14 @@ import dev.frost819.newbv.app.util.PlaybackCandidate
 import dev.frost819.newbv.app.util.PlayerConstants
 import dev.frost819.newbv.app.util.VideoCapabilityProvider
 import dev.frost819.newbv.app.util.VideoDecodeProfile
+import dev.frost819.newbv.app.util.cdnHostOf
+import dev.frost819.newbv.app.util.cdnLineLabel
 import dev.frost819.newbv.app.util.collectCodecs
 import dev.frost819.newbv.app.util.findTrack
+import dev.frost819.newbv.app.util.isOfficialCdnUrl
 import dev.frost819.newbv.app.util.orderQualities
 import dev.frost819.newbv.app.util.pickDecodableProfile
+import dev.frost819.newbv.app.util.playUrlDeadlineSeconds
 import dev.frost819.newbv.app.util.toPlaybackLoadErrorMessage
 import dev.frost819.newbv.app.util.trackMatchesCodec
 import dev.frost819.newbv.biliapi.entity.ApiType
@@ -47,8 +51,13 @@ import dev.frost819.newbv.player.AbstractVideoPlayer
 import dev.frost819.newbv.player.CdnSelector
 import dev.frost819.newbv.player.VideoPlayerListener
 import dev.frost819.newbv.player.VideoPlayerOptions
+import dev.frost819.newbv.player.failedRequestUrl
+import dev.frost819.newbv.player.httpResponseCode
 import dev.frost819.newbv.player.impl.exo.ExoPlayerFactory
+import dev.frost819.newbv.player.isAddressInvalidHttpCode
 import dev.frost819.newbv.player.isNetworkError
+import dev.frost819.newbv.player.isOutOfMemory
+import dev.frost819.newbv.player.toPlaybackErrorDetail
 import dev.frost819.newbv.player.toPlaybackErrorMessage
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -78,6 +87,26 @@ private const val PLAYER_ACTION_TIMEOUT_MS = 10_000L
 
 /** 同时观看人数刷新间隔（cid 就绪后周期轮询）。 */
 private const val ONLINE_WATCH_REFRESH_MS = 60_000L
+
+/** 故障自救时重新获取播放地址的超时。 */
+private const val PLAY_DATA_REFRESH_TIMEOUT_MS = 10_000L
+
+/**
+ * 一轮故障自救的时间窗。
+ *
+ * 距上次自救超过该时长再出错，视为新一轮故障，重新获得一次「重新获取播放地址」的机会；
+ * 窗口内每轮最多重拉一次，避免地址接口被连续请求。
+ */
+private const val RECOVERY_EPISODE_WINDOW_MS = 60_000L
+
+/** 卡顿看门狗的观察周期：持续缓冲这么久且几乎没有进展，判定当前线路吞吐塌陷。 */
+private const val STALL_SWITCH_TIMEOUT_MS = 12_000L
+
+/** 一个观察周期内缓冲至少要推进的媒体时长；达不到才换线路（只是网速慢时换线路会白丢已缓冲数据）。 */
+private const val STALL_MIN_PROGRESS_MS = 1_000L
+
+/** 播放地址过期判定的提前量（秒）：临近过期即视为已过期，避免切过去马上失效。 */
+private const val PLAY_URL_EXPIRY_MARGIN_S = 30L
 
 /**
  * 音频解码失败时的回退顺序。
@@ -156,8 +185,17 @@ class PlayerViewModel
         /** 当前音频轨道按推荐顺序排列的 CDN 候选。 */
         private var audioCdnCandidates: List<String> = emptyList()
 
-        /** 运行时 CDN 回退已尝试到的候选下标。 */
-        private var cdnFallbackIndex = 0
+        /** 当前使用的视频候选下标（指向 [videoCdnCandidates]）。 */
+        private var videoCdnIndex = 0
+
+        /** 当前使用的音频候选下标（指向 [audioCdnCandidates]）。 */
+        private var audioCdnIndex = 0
+
+        /** 本轮故障自救是否已重新获取过播放地址（每轮最多一次）。 */
+        private var playDataRefreshedInEpisode = false
+
+        /** 最近一次故障自救的时间（毫秒时间戳），用于划分「轮」。 */
+        private var lastRecoveryAtMs = 0L
 
         private val detachedWorkScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -193,6 +231,12 @@ class PlayerViewModel
         private var previewTipCountdownJob: Job? = null
         private var onlineWatchJob: Job? = null
 
+        /** 故障自救中「重新获取播放地址并续播」的任务。 */
+        private var recoverJob: Job? = null
+
+        /** 卡顿看门狗任务（缓冲期间存活）。 */
+        private var stallWatchJob: Job? = null
+
         /**
          * 切换视频事件。
          *
@@ -207,12 +251,20 @@ class PlayerViewModel
         private val videoPlayerListener =
             object : VideoPlayerListener {
                 override fun onError(error: Exception) {
-                    logger.info { "onError: $error" }
-                    // 仅网络类错误换 CDN 有意义：解码 / 音频管线错误换源地址不会改善，
+                    // 连同原因链一起记录：「Source error」只是外壳，真正的原因
+                    // （HTTP 状态码 / 超时 / 内存耗尽）在 cause 里
+                    logger.error(error) { "onError: $error" }
+                    stopStallWatch()
+                    // 加载线程内存耗尽会被 media3 包装成 Source error，换线路无济于事
+                    if (error.isOutOfMemory()) {
+                        failPlayback("内存不足，请降低画质后重试")
+                        return
+                    }
+                    // 仅网络类错误换线路 / 重拉地址有意义：解码 / 音频管线错误换源地址不会改善，
                     // 直接进入错误态（音频回退由 onAudioDecodeUnsupported 单独处理）
-                    if (Prefs.autoSelectCdn && error.isNetworkError() && tryNextCdnFallback()) return
+                    if (error.isNetworkError() && tryRecoverFromNetworkError(error)) return
                     // 其余错误进入错误态
-                    failPlayback(error.toPlaybackErrorMessage())
+                    failPlayback(error.toDetailedErrorMessage())
                 }
 
                 override fun onVideoDecodeUnsupported() {
@@ -233,6 +285,7 @@ class PlayerViewModel
 
                 override fun onReady() {
                     logger.info { "onReady" }
+                    stopStallWatch()
                     _uiState.update { it.copy(playerState = PlayerState.Ready) }
                     updatePlaySpeed(forceUpdate = true)
                     startSeekerUpdater()
@@ -241,6 +294,7 @@ class PlayerViewModel
 
                 override fun onPlay() {
                     logger.info { "onPlay" }
+                    stopStallWatch()
                     _uiState.update { it.copy(playerState = PlayerState.Playing, isBuffering = false) }
                     if (_uiState.value.lastPlayed > 0) {
                         seekToLastPlayed()
@@ -258,10 +312,12 @@ class PlayerViewModel
                 override fun onBuffering() {
                     logger.info { "onBuffering" }
                     _uiState.update { it.copy(isBuffering = true) }
+                    startStallWatch()
                 }
 
                 override fun onEnd() {
                     logger.info { "onEnd" }
+                    stopStallWatch()
                     stopSeekerUpdater()
                     stopDebugInfoUpdater()
                     _uiState.update { it.copy(playerState = PlayerState.Ended) }
@@ -463,6 +519,7 @@ class PlayerViewModel
         /** 释放播放器资源，同步进度到 B 站。 */
         fun detachPlayer() {
             syncProgress(scope = detachedWorkScope, isDetaching = true)
+            cancelRecovery()
             videoPlayer?.release()
             videoPlayer = null
             stopSeekerUpdater()
@@ -471,9 +528,18 @@ class PlayerViewModel
             clockUpdateJob?.cancel()
         }
 
-        /** 播放/暂停切换。 */
+        /**
+         * 播放/暂停切换。
+         *
+         * 错误态下播放器已停在空闲状态，单纯「继续播放」不会重新加载，
+         * 因此此时按播放键等同于重试（见 [retryPlayback]）。
+         */
         fun togglePlayPause() {
             val player = videoPlayer ?: return
+            if (_uiState.value.playerState is PlayerState.Error) {
+                retryPlayback()
+                return
+            }
             if (player.isPlaying) {
                 player.pause()
             } else {
@@ -726,6 +792,11 @@ class PlayerViewModel
 
             // 清空旧视频状态，防止新视频加载失败时残留旧数据
             playData = null
+            cancelRecovery()
+            videoCdnCandidates = emptyList()
+            audioCdnCandidates = emptyList()
+            videoCdnIndex = 0
+            audioCdnIndex = 0
             stopSeekerUpdater()
             stopDebugInfoUpdater()
 
@@ -751,6 +822,8 @@ class PlayerViewModel
                     availableQuality = emptyMap(),
                     availableVideoCodec = emptyList(),
                     availableAudio = emptyList(),
+                    cdnLines = emptyList(),
+                    cdnLineIndex = 0,
                     onlineWatching = "",
                     showPreviewTip = false,
                     showSkipToNextEp = false,
@@ -857,9 +930,11 @@ class PlayerViewModel
         }
 
         /**
-         * 更新媒体格式（画质/编码/音轨）。
+         * 更新媒体格式（画质/编码/音轨）或手动切换线路。
          *
          * 如果当前正在播放，会暂停、重新解析 URL、恢复进度后继续播放。
+         * 出错后或播放地址已过期时，会先重新获取一批播放地址再切换——
+         * 缓存的那批地址共用过期时间与签名，其中一条失效时其余的大概率同样失效。
          */
         fun updateMediaProfile(action: MediaProfileSettingAction) {
             val old = _uiState.value.mediaProfileState
@@ -868,11 +943,17 @@ class PlayerViewModel
                     is MediaProfileSettingAction.SetQuality -> old.copy(qualityId = action.qualityId)
                     is MediaProfileSettingAction.SetVideoCodec -> old.copy(videoCodec = action.codec)
                     is MediaProfileSettingAction.SetAudio -> old.copy(audio = action.audio)
+                    is MediaProfileSettingAction.SetCdnLine -> {
+                        selectCdnLine(action.index)
+                        return
+                    }
                 }
             if (old == new) return
 
             // 用户手动切换，重置回退状态，避免误判为「已尝试」
             resetFallbackState()
+            cancelRecovery()
+            val needFreshAddress = _uiState.value.playerState is PlayerState.Error || isPlayDataExpired()
 
             // 同步刷新该画质下的可用编码列表（编码菜单随画质联动）
             _uiState.update {
@@ -885,6 +966,8 @@ class PlayerViewModel
             videoPlayer?.let { player ->
                 // resolveMediaUrls 在开启自动选源时会做测速（挂起），需放入协程
                 viewModelScope.launch {
+                    // 旧地址多半已整体失效：先换一批新的。失败不拦截，继续用旧数据尽力而为
+                    if (needFreshAddress) refreshPlayDataQuietly()
                     // 先解析地址（可能测速）再切换：解析期间旧流照常播放，不出现暂停空档
                     val mediaUrls = resolveMediaUrls(new.qualityId, new.videoCodec, new.audio)
                     if (mediaUrls == null) {
@@ -907,6 +990,15 @@ class PlayerViewModel
         private fun resetFallbackState() {
             attemptedDecodeProfiles.clear()
             attemptedAudioFallbacks.clear()
+            playDataRefreshedInEpisode = false
+            lastRecoveryAtMs = 0L
+        }
+
+        /** 取消进行中的故障自救任务与卡顿看门狗（切集 / 手动操作 / 释放播放器时调用）。 */
+        private fun cancelRecovery() {
+            recoverJob?.cancel()
+            recoverJob = null
+            stopStallWatch()
         }
 
         /**
@@ -923,12 +1015,28 @@ class PlayerViewModel
             position: Long,
         ) {
             val player = videoPlayer ?: return
-            _uiState.update { it.copy(playerState = PlayerState.Ready, isBuffering = true) }
+            _uiState.update {
+                it.copy(
+                    playerState = PlayerState.Ready,
+                    isBuffering = true,
+                    cdnLineIndex = videoCdnIndex,
+                )
+            }
             player.pause()
             player.playUrl(urls.videoUrl, urls.audioUrl)
             player.prepare()
             if (position > 0) player.seekTo(position)
             player.start()
+            // 换源时播放器可能本就处于缓冲态，不会再回调 onBuffering：这里显式重启看门狗
+            stopStallWatch()
+            startStallWatch()
+        }
+
+        /** 用当前选中的候选地址（[videoCdnIndex] / [audioCdnIndex]）在指定位置续播。 */
+        private fun replayCurrentCandidates(position: Long) {
+            val videoUrl = videoCdnCandidates.getOrNull(videoCdnIndex) ?: return
+            val audioUrl = audioCdnCandidates.getOrNull(audioCdnIndex)
+            replayMedia(MediaUrls(videoUrl = videoUrl, audioUrl = audioUrl), position)
         }
 
         /**
@@ -1082,6 +1190,7 @@ class PlayerViewModel
 
         /** 置播放错误状态。 */
         private fun failPlayback(message: String) {
+            stopStallWatch()
             _uiState.update {
                 it.copy(
                     playerState = PlayerState.Error(message),
@@ -1289,25 +1398,49 @@ class PlayerViewModel
             audioItem?.baseUrl?.let { audioUrls.add(it) }
             audioUrls.addAll(audioItem?.backUrl ?: emptyList())
 
-            val videoCandidates = officialCdnCandidates(videoUrls.filterNotNull())
-            val audioCandidates = officialCdnCandidates(audioUrls)
-
-            // 开启自动选源时对候选测速排序（结果按 host 缓存），否则沿用原有顺序
-            videoCdnCandidates =
-                if (Prefs.autoSelectCdn) cdnSelector.rank(videoCandidates) else videoCandidates
-            audioCdnCandidates =
-                if (Prefs.autoSelectCdn && audioCandidates.isNotEmpty()) {
-                    cdnSelector.rank(audioCandidates)
-                } else {
-                    audioCandidates
-                }
-            cdnFallbackIndex = 0
+            // 开启自动选源时对候选测速排序（结果按 host 缓存），否则沿用接口顺序、仅把已知故障节点后移
+            videoCdnCandidates = arrangeCdnCandidates(videoUrls.filterNotNull())
+            audioCdnCandidates = arrangeCdnCandidates(audioUrls)
+            videoCdnIndex = 0
+            audioCdnIndex = 0
 
             val videoUrl = videoCdnCandidates.firstOrNull() ?: return null
             val audioUrl = audioCdnCandidates.firstOrNull()
 
-            _uiState.update { it.copy(videoHeight = foundVideo.height, videoWidth = foundVideo.width) }
+            _uiState.update {
+                it.copy(
+                    videoHeight = foundVideo.height,
+                    videoWidth = foundVideo.width,
+                    cdnLines =
+                        videoCdnCandidates.mapIndexed { index, url ->
+                            cdnLineLabel(index, url, cdnSelector.speedOf(url))
+                        },
+                    cdnLineIndex = 0,
+                )
+            }
             return MediaUrls(videoUrl, audioUrl)
+        }
+
+        /**
+         * 整理某条轨道的候选地址顺序。
+         *
+         * 官方 CDN 在前：开启自动选源时按测速结果排序，否则保持接口顺序、仅把已知故障节点后移；
+         * PCDN / 裸 IP 地址不参与测速，追加在最后作为兜底（官方节点全部不可用时仍有路可走）。
+         */
+        private suspend fun arrangeCdnCandidates(urls: List<String>): List<String> {
+            val distinct = urls.filter { it.isNotBlank() }.distinct()
+            val (official, others) = distinct.partition { isOfficialCdnUrl(it) }
+            val preferred = official.ifEmpty { others }
+            val lastResort = if (official.isEmpty()) emptyList() else others
+            if (preferred.isEmpty()) return emptyList()
+            val ordered =
+                if (Prefs.autoSelectCdn) {
+                    cdnSelector.rank(preferred)
+                } else {
+                    cdnSelector.deprioritizeFailed(preferred)
+                }
+            // 选择器异常返回空列表时退回原顺序，绝不因排序丢掉可用地址
+            return ordered.ifEmpty { preferred } + lastResort
         }
 
         private fun executePlayback(mediaUrls: MediaUrls) {
@@ -1488,43 +1621,322 @@ class PlayerViewModel
                 }
         }
 
+        // ── 线路故障自救 ──────────────────────────────────────────
+
         /**
-         * 过滤出官方 CDN 候选地址。
+         * 网络类错误的自救入口，返回是否已接管（`false` 表示无计可施，由调用方上报错误）。
          *
-         * 过滤掉 mcdn/szbdyd/IP 地址的 URL，优先使用官方 CDN；若全部被过滤则回退原列表。
+         * 依次尝试：
+         * 1. 换到出错那条流（视频 / 音频）的下一个候选地址，从原位置续播；
+         * 2. 候选用尽，或错误表明地址本身已失效（HTTP 403/404 等、已过期）时，
+         *    重新获取一批播放地址后续播——每轮故障最多一次；
+         * 3. 重拉之后仍失败：把新一批的候选试完，全部失败才放弃。
+         *
+         * 候选下标只增不减、每轮最多重拉一次，因此流程必然终止。
          */
-        private fun officialCdnCandidates(urls: List<String>): List<String> {
-            val filtered =
-                urls
-                    .filter { !it.contains(".mcdn.bilivideo.") }
-                    .filter { !it.contains(".szbdyd.com") }
-                    .filter {
-                        !Regex(
-                            "^(https?://)?(\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}(:\\d{1,5})?)(/.*)?(\\?.*)?$",
-                        ).matches(it)
-                    }
-            return filtered.ifEmpty { urls }
+        private fun tryRecoverFromNetworkError(error: Throwable): Boolean {
+            val player = videoPlayer ?: return false
+            val position = player.currentPosition
+
+            val now = System.currentTimeMillis()
+            if (now - lastRecoveryAtMs > RECOVERY_EPISODE_WINDOW_MS) playDataRefreshedInEpisode = false
+            lastRecoveryAtMs = now
+
+            val failedUrl = error.failedRequestUrl()
+            val failedTrack = trackOf(failedUrl)
+            val httpCode = error.httpResponseCode()
+            // 记下故障节点：后续排序时排到最后（含之后打开的其它视频）
+            when (failedTrack) {
+                FailedTrack.Video -> videoCdnCandidates.getOrNull(videoCdnIndex)
+                FailedTrack.Audio -> audioCdnCandidates.getOrNull(audioCdnIndex)
+                FailedTrack.Unknown -> failedUrl
+            }?.let { cdnSelector.reportFailure(it) }
+
+            val addressInvalid = isAddressInvalidHttpCode(httpCode) || isPlayDataExpired()
+            logger.info {
+                "Recover from network error: track=$failedTrack, http=$httpCode, " +
+                    "addressInvalid=$addressInvalid, refreshed=$playDataRefreshedInEpisode, " +
+                    "video=${videoCdnIndex + 1}/${videoCdnCandidates.size}, " +
+                    "audio=${audioCdnIndex + 1}/${audioCdnCandidates.size}, url=$failedUrl"
+            }
+
+            // 地址本身失效时同批候选大概率一起失效，轮换只会白等：跳过，直接重拉
+            if (!addressInvalid && switchToNextCandidate(failedTrack)) {
+                announceLineSwitch("当前播放线路异常，已切换到备用线路")
+                replayCurrentCandidates(position)
+                return true
+            }
+            if (!playDataRefreshedInEpisode) {
+                playDataRefreshedInEpisode = true
+                launchRefreshAndReplay(
+                    position = position,
+                    notice =
+                        if (addressInvalid) {
+                            "播放地址已失效，正在重新获取"
+                        } else {
+                            "备用线路已用尽，正在重新获取播放地址"
+                        },
+                )
+                return true
+            }
+            // 本轮已重拉过：把剩余候选试完再放弃
+            if (addressInvalid && switchToNextCandidate(failedTrack)) {
+                announceLineSwitch("当前播放线路异常，已切换到备用线路")
+                replayCurrentCandidates(position)
+                return true
+            }
+            return false
+        }
+
+        /** 根据失败请求的地址判断出错的是哪条流（比较时忽略查询参数）。 */
+        private fun trackOf(failedUrl: String?): FailedTrack {
+            val key = failedUrl?.substringBefore('?') ?: return FailedTrack.Unknown
+            return when (key) {
+                videoCdnCandidates.getOrNull(videoCdnIndex)?.substringBefore('?') -> FailedTrack.Video
+                audioCdnCandidates.getOrNull(audioCdnIndex)?.substringBefore('?') -> FailedTrack.Audio
+                else -> FailedTrack.Unknown
+            }
         }
 
         /**
-         * 尝试切换到下一个候选 CDN 地址重播。
+         * 把出错的那条流切到下一个候选地址。
          *
-         * 仅在开启自动选源且仍有未尝试的候选时生效。保留当前播放位置，
-         * 切换成功返回 `true`，无候选可用返回 `false`（由调用方上报错误）。
+         * 音视频多数在同一节点上：节点整体故障时另一条流紧接着也会出错，
+         * 因此另一条流若与出错的流同节点，就一起换，省掉一轮「报错 → 重播」。
+         * 分不清是哪条流出错时两条都换。
+         *
+         * @return 是否确实换到了新的候选；出错的那条流已无候选时返回 `false`
          */
-        private fun tryNextCdnFallback(): Boolean {
-            val player = videoPlayer ?: return false
-            val nextIndex = cdnFallbackIndex + 1
-            val videoUrl = videoCdnCandidates.getOrNull(nextIndex) ?: return false
-            cdnFallbackIndex = nextIndex
-            val audioUrl = audioCdnCandidates.firstOrNull()
-            val position = player.currentPosition
-            logger.info { "CDN fallback #$nextIndex -> $videoUrl" }
-            viewModelScope.launch {
-                _uiEffect.emit(PlayerUiEffect.ShowToast("当前播放线路异常，已切换到备用线路"))
+        private fun switchToNextCandidate(track: FailedTrack): Boolean {
+            val hasNextVideo = videoCdnIndex + 1 < videoCdnCandidates.size
+            val hasNextAudio = audioCdnIndex + 1 < audioCdnCandidates.size
+            val sameHost = isAudioOnVideoHost()
+            return when (track) {
+                FailedTrack.Video -> {
+                    if (hasNextVideo) {
+                        videoCdnIndex++
+                        if (sameHost && hasNextAudio) audioCdnIndex++
+                    }
+                    hasNextVideo
+                }
+                FailedTrack.Audio -> {
+                    if (hasNextAudio) {
+                        audioCdnIndex++
+                        if (sameHost && hasNextVideo) videoCdnIndex++
+                    }
+                    hasNextAudio
+                }
+                FailedTrack.Unknown -> {
+                    if (hasNextVideo) videoCdnIndex++
+                    if (hasNextAudio) audioCdnIndex++
+                    hasNextVideo || hasNextAudio
+                }
             }
-            replayMedia(MediaUrls(videoUrl = videoUrl, audioUrl = audioUrl), position)
-            return true
+        }
+
+        /** 当前音频与视频是否在同一个 CDN 节点上。 */
+        private fun isAudioOnVideoHost(): Boolean {
+            val video = videoCdnCandidates.getOrNull(videoCdnIndex) ?: return false
+            val audio = audioCdnCandidates.getOrNull(audioCdnIndex) ?: return false
+            return cdnHostOf(video) == cdnHostOf(audio)
+        }
+
+        /** 提示用户线路已切换（非阻塞）。 */
+        private fun announceLineSwitch(message: String) {
+            logger.info {
+                "CDN switch -> video #${videoCdnIndex + 1} ${videoCdnCandidates.getOrNull(videoCdnIndex)}, " +
+                    "audio #${audioCdnIndex + 1}"
+            }
+            viewModelScope.launch { _uiEffect.emit(PlayerUiEffect.ShowToast(message)) }
+        }
+
+        /**
+         * 出错后重试：重新获取播放地址并从出错位置续播。
+         *
+         * 错误态下的播放键 / 确认键走这里。连播放地址都没拿到（起播阶段失败）时，
+         * 重走完整加载流程。
+         */
+        fun retryPlayback() {
+            val player = videoPlayer ?: return
+            cancelRecovery()
+            resetFallbackState()
+            if (playData == null) {
+                _uiState.update { it.copy(playerState = PlayerState.Ready, isBuffering = true) }
+                loadVideoWithResources()
+                return
+            }
+            // 手动重试本身就是一次重拉：紧接着再出错时不再自动重拉第二次
+            playDataRefreshedInEpisode = true
+            lastRecoveryAtMs = System.currentTimeMillis()
+            launchRefreshAndReplay(player.currentPosition, notice = null)
+        }
+
+        /**
+         * 启动「重新获取播放地址并续播」任务，并立即进入加载态（清掉旧错误文案）。
+         *
+         * @param position 续播位置（毫秒）
+         * @param notice 给用户的提示；null 表示不提示（用户主动重试时）
+         */
+        private fun launchRefreshAndReplay(
+            position: Long,
+            notice: String?,
+        ) {
+            recoverJob?.cancel()
+            _uiState.update { it.copy(playerState = PlayerState.Ready, isBuffering = true) }
+            recoverJob =
+                viewModelScope.launch {
+                    if (notice != null) {
+                        launch { _uiEffect.emit(PlayerUiEffect.ShowToast(notice)) }
+                    }
+                    try {
+                        reloadPlayData()
+                    } catch (e: TimeoutCancellationException) {
+                        failPlayback("重新获取播放地址超时，请按确认键重试")
+                        return@launch
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        logger.error(e) { "Refresh play data failed: $e" }
+                        failPlayback(e.toPlaybackLoadErrorMessage())
+                        return@launch
+                    }
+                    val profile = _uiState.value.mediaProfileState
+                    val urls = resolveMediaUrls(profile.qualityId, profile.videoCodec, profile.audio)
+                    if (urls == null) {
+                        failPlayback("视频源解析失败，请稍后重试")
+                        return@launch
+                    }
+                    replayMedia(urls, position)
+                }
+        }
+
+        /**
+         * 重新获取当前视频的播放地址并替换 [playData]。
+         *
+         * 不改动用户当前的画质 / 编码 / 音轨选择；获取期间若已切到别的视频则丢弃结果。
+         *
+         * @throws Exception 获取失败或超时（[TimeoutCancellationException]）时抛出
+         */
+        private suspend fun reloadPlayData() {
+            val state = _uiState.value
+            val fresh =
+                withTimeout(PLAY_DATA_REFRESH_TIMEOUT_MS) {
+                    fetchPlayData(state.aid, state.cid, state.epid ?: 0, getApiType())
+                }
+            // 接口偶尔会返回不含任何视频流的结果（如触发风控）：当作失败，保留旧数据
+            check(fresh.dashVideos.isNotEmpty()) { "未获取到可用的播放地址" }
+            if (_uiState.value.cid == state.cid) playData = fresh
+        }
+
+        /**
+         * 尽力重新获取播放地址，失败时保留旧数据。
+         *
+         * @return 是否成功换到了新数据
+         */
+        private suspend fun refreshPlayDataQuietly(): Boolean =
+            try {
+                reloadPlayData()
+                true
+            } catch (e: TimeoutCancellationException) {
+                logger.warn { "Refresh play data timed out" }
+                false
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.warn { "Refresh play data failed: $e" }
+                false
+            }
+
+        /**
+         * 当前这批播放地址是否已过期（或即将过期）。
+         *
+         * B 站播放地址的 `deadline` 参数是过期时间（秒级时间戳）；地址里没有该参数时无法判断，返回 `false`。
+         */
+        private fun isPlayDataExpired(): Boolean {
+            val url = videoCdnCandidates.getOrNull(videoCdnIndex) ?: return false
+            val deadline = playUrlDeadlineSeconds(url) ?: return false
+            return System.currentTimeMillis() / 1000 >= deadline - PLAY_URL_EXPIRY_MARGIN_S
+        }
+
+        /**
+         * 手动切换视频线路（播放器菜单「线路」）。
+         *
+         * 音频尽量跟随到同一节点。错误态下重选当前线路也会重新加载，相当于指定线路重试。
+         *
+         * @param index 目标线路在 [PlayerUiState.cdnLines] 中的下标
+         */
+        private fun selectCdnLine(index: Int) {
+            val player = videoPlayer ?: return
+            if (index !in videoCdnCandidates.indices) return
+            val inError = _uiState.value.playerState is PlayerState.Error
+            if (index == videoCdnIndex && !inError) return
+
+            cancelRecovery()
+            resetFallbackState()
+            videoCdnIndex = index
+            val host = cdnHostOf(videoCdnCandidates[index])
+            audioCdnCandidates
+                .indexOfFirst { cdnHostOf(it) == host }
+                .takeIf { it >= 0 }
+                ?.let { audioCdnIndex = it }
+            logger.info { "Manual CDN line #${index + 1} -> ${videoCdnCandidates[index]}" }
+            replayCurrentCandidates(player.currentPosition)
+        }
+
+        // ── 卡顿看门狗 ────────────────────────────────────────────
+
+        /**
+         * 启动卡顿看门狗（进入缓冲态 / 换源时调用，就绪 / 出错 / 结束时停止）。
+         *
+         * 起播测速只能说明节点「起步快不快」，有的节点长连接一段时间后吞吐会塌陷，
+         * 表现为长时间转圈却迟迟不报错。看门狗每个周期检查一次缓冲是否还在推进：
+         * 几乎不动就判定线路塌陷，主动切到下一条线路；仍在推进（只是网速慢）则继续等，
+         * 避免换线路白白丢掉已缓冲的数据。线路只向后切，候选用尽即停，不会来回横跳。
+         */
+        private fun startStallWatch() {
+            if (stallWatchJob?.isActive == true) return
+            val initialBuffered = videoPlayer?.bufferedPosition ?: return
+            stallWatchJob =
+                viewModelScope.launch {
+                    var lastBuffered = initialBuffered
+                    while (isActive) {
+                        delay(STALL_SWITCH_TIMEOUT_MS)
+                        val player = videoPlayer ?: return@launch
+                        if (_uiState.value.playerState is PlayerState.Error) return@launch
+                        // 用户主动暂停时的缓冲不算卡顿
+                        if (!player.isPlayRequested) return@launch
+                        val buffered = player.bufferedPosition
+                        if (buffered - lastBuffered >= STALL_MIN_PROGRESS_MS) {
+                            lastBuffered = buffered
+                            continue
+                        }
+                        switchLineOnStall(player)
+                        return@launch
+                    }
+                }
+        }
+
+        private fun stopStallWatch() {
+            stallWatchJob?.cancel()
+            stallWatchJob = null
+        }
+
+        /**
+         * 当前线路吞吐塌陷：标记该节点并切到下一条视频线路；没有下一条时保持现状。
+         *
+         * 音频若在同一节点上则一并切走——缓冲进度取音视频中较慢的一条，卡住的可能正是音频。
+         */
+        private fun switchLineOnStall(player: AbstractVideoPlayer) {
+            val current = videoCdnCandidates.getOrNull(videoCdnIndex) ?: return
+            if (videoCdnIndex + 1 >= videoCdnCandidates.size) return
+            val audioFollows = isAudioOnVideoHost() && audioCdnIndex + 1 < audioCdnCandidates.size
+            cdnSelector.reportSlow(current)
+            videoCdnIndex++
+            if (audioFollows) audioCdnIndex++
+            // 本协程即看门狗自身：先摘掉引用，replayMedia 才能为新线路重新启动看门狗
+            stallWatchJob = null
+            announceLineSwitch("当前线路卡顿，已切换到备用线路")
+            replayCurrentCandidates(player.currentPosition)
         }
 
         private fun findNextPlayTarget(): NextPlayTarget? {
@@ -1637,6 +2049,22 @@ class PlayerViewModel
             val videoUrl: String,
             val audioUrl: String?,
         )
+
+        /** 出错的是哪条流。 */
+        private enum class FailedTrack {
+            Video,
+            Audio,
+
+            /** 无法从异常中判断（非 HTTP 层错误，或地址对不上当前候选）。 */
+            Unknown,
+        }
+
+        /** 面向用户的错误提示，能识别出技术原因时附在括号里（如 `HTTP 403`），便于反馈定位。 */
+        private fun Throwable.toDetailedErrorMessage(): String {
+            val message = toPlaybackErrorMessage()
+            val detail = toPlaybackErrorDetail() ?: return message
+            return "$message（$detail）"
+        }
 
         override fun onCleared() {
             // 退出页面时才真正释放播放器（进入详情等覆盖页面不会走到这里）

@@ -7,13 +7,17 @@ import dagger.hilt.InstallIn
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dagger.hilt.components.SingletonComponent
 import dev.frost819.newbv.app.util.MediaCodecVideoCapabilityProvider
+import dev.frost819.newbv.app.util.PlayerConstants
 import dev.frost819.newbv.app.util.VideoCapabilityProvider
+import dev.frost819.newbv.biliapi.entity.ApiType
+import dev.frost819.newbv.data.datastore.Prefs
 import dev.frost819.newbv.player.CdnSelector
 import dev.frost819.newbv.player.OkHttpCdnSelector
 import dev.frost819.newbv.player.OkHttpUtil
 import dev.frost819.newbv.player.impl.exo.ExoPlayerFactory
 import okhttp3.OkHttpClient
 import javax.inject.Singleton
+import dev.frost819.newbv.data.datastore.ApiType as DataApiType
 
 /**
  * 播放器相关 Hilt 模块。
@@ -66,8 +70,22 @@ object PlayerModule {
      * 复用 [providePlayerHttpClient] 的共享 client（内部会派生一个短超时的测速专用 client，
      * 但连接池与原 client 一致，避免额外连接池）对候选播放地址测速，
      * 结果按 host 缓存，供 [dev.frost819.newbv.app.viewmodel.player.PlayerViewModel] 选流使用。
+     *
+     * 测速请求头按当前接口类型取，与播放器实际拉流保持一致（见
+     * [dev.frost819.newbv.app.viewmodel.player.PlayerViewModel.initVideoPlayer]）：
+     * 部分节点对不同 User-Agent / Referer 的响应不同，用另一套请求头测出来的结果不可信。
      */
     @Provides
     @Singleton
-    fun provideCdnSelector(playerHttpClient: OkHttpClient): CdnSelector = OkHttpCdnSelector(playerHttpClient)
+    fun provideCdnSelector(playerHttpClient: OkHttpClient): CdnSelector =
+        OkHttpCdnSelector(
+            client = playerHttpClient,
+            headersProvider = {
+                val apiType = if (Prefs.apiType == DataApiType.App) ApiType.App else ApiType.Web
+                buildMap {
+                    put("User-Agent", PlayerConstants.getUserAgent(apiType))
+                    PlayerConstants.getReferer(apiType)?.let { put("Referer", it) }
+                }
+            },
+        )
 }

@@ -66,6 +66,24 @@ abstract class AbstractVideoPlayer {
     /** 缓冲百分比（0-100） */
     abstract val bufferedPercentage: Int
 
+    /**
+     * 已缓冲到的媒体位置（毫秒）。
+     *
+     * 比 [bufferedPercentage] 精细，用于判断「缓冲是否还在推进」（卡顿看门狗）。
+     * 默认返回 0，表示实现不支持。
+     */
+    open val bufferedPosition: Long
+        get() = 0L
+
+    /**
+     * 当前是否处于「用户希望播放」的状态（即使正在缓冲尚未出画面）。
+     *
+     * 用于区分「缓冲中」与「用户主动暂停」：只有前者才需要卡顿自救。
+     * 默认返回 false，表示实现不支持。
+     */
+    open val isPlayRequested: Boolean
+        get() = false
+
     /** 设置播放配置（如自动播放） */
     abstract fun setOptions()
 

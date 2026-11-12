@@ -16,7 +16,7 @@ import dev.frost819.newbv.data.datastore.VideoCodec
  * 画质设置面板。
  *
  * 双列布局：左侧为选项值列表（[RadioMenuList]），右侧为子项列表。
- * 子项包括：分辨率、编码、宽高比、音轨。
+ * 子项包括：分辨率、编码、宽高比、音轨、线路。
  *
  * @param modifier 修饰符
  * @param availableQualityIds 可用画质 ID 列表
@@ -26,10 +26,13 @@ import dev.frost819.newbv.data.datastore.VideoCodec
  * @param currentVideoCodec 当前编码
  * @param currentVideoAspectRatio 当前宽高比
  * @param currentAudio 当前音轨
+ * @param cdnLines 候选线路展示文案（按推荐顺序）
+ * @param currentCdnLine 当前线路下标
  * @param onResolutionChange 画质变化回调
  * @param onCodecChange 编码变化回调
  * @param onAspectRatioChange 宽高比变化回调
  * @param onAudioChange 音轨变化回调
+ * @param onCdnLineChange 线路变化回调（参数为线路下标）
  * @param onFocusStateChange 焦点状态变化回调
  */
 @Composable
@@ -42,10 +45,13 @@ fun PictureMenuList(
     currentVideoCodec: VideoCodec,
     currentVideoAspectRatio: VideoAspectRatio,
     currentAudio: Audio,
+    cdnLines: List<String> = emptyList(),
+    currentCdnLine: Int = 0,
     onResolutionChange: (Int) -> Unit,
     onCodecChange: (VideoCodec) -> Unit,
     onAspectRatioChange: (VideoAspectRatio) -> Unit,
     onAudioChange: (Audio) -> Unit,
+    onCdnLineChange: (Int) -> Unit = {},
     onFocusStateChange: (MenuFocusState) -> Unit,
 ) {
     val qualityIdList =
@@ -97,6 +103,15 @@ fun PictureMenuList(
                     items = audioList.map { it.displayName },
                     selected = audioList.indexOf(currentAudio),
                     onSelectedChanged = { onAudioChange(audioList[it]) },
+                    onFocusBackToParent = backToMenu,
+                )
+
+            VideoPlayerPictureMenuItem.CdnLine ->
+                RadioMenuList(
+                    modifier = itemModifier,
+                    items = cdnLines,
+                    selected = currentCdnLine,
+                    onSelectedChanged = onCdnLineChange,
                     onFocusBackToParent = backToMenu,
                 )
         }

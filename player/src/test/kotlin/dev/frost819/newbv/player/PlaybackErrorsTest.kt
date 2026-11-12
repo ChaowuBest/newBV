@@ -4,9 +4,13 @@ import androidx.media3.common.PlaybackException
 import com.google.common.truth.Truth.assertThat
 import org.junit.jupiter.api.Test
 import java.io.IOException
+import java.net.ConnectException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
+import javax.net.ssl.SSLHandshakeException
 
 /**
- * [isAudioRenderError] 与 [toPlaybackErrorMessage] 的单元测试。
+ * [isAudioRenderError]、[toPlaybackErrorMessage] 以及线路故障判定（[isOutOfMemory] 等）的单元测试。
  *
  * media3 会把音频输出链路上的断言失败归为 `ERROR_CODE_UNSPECIFIED`，
  * 此时只能靠堆栈识别，因此用例里用伪造的栈帧模拟 `DefaultAudioSink` 抛错。
@@ -111,6 +115,63 @@ class PlaybackErrorsTest {
     @Test
     fun `plain exception maps to fallback message`() {
         assertThat(IllegalStateException("boom").toPlaybackErrorMessage()).isEqualTo("播放失败，请稍后重试")
+    }
+
+    // ── 线路故障自救用到的判定 ─────────────────────────────────
+
+    @Test
+    fun `out of memory wrapped in io exception is detected`() {
+        // Given: media3 把加载线程的 OutOfMemoryError 包成 IOException（表面是 Source error）
+        val error = IOException("Unexpected OutOfMemoryError", OutOfMemoryError("heap"))
+
+        assertThat(error.isOutOfMemory()).isTrue()
+        assertThat(error.toPlaybackErrorDetail()).isEqualTo("内存不足")
+    }
+
+    @Test
+    fun `plain io exception is not out of memory`() {
+        assertThat(IOException("reset").isOutOfMemory()).isFalse()
+    }
+
+    @Test
+    fun `auth and missing resource codes mean the address itself is invalid`() {
+        listOf(401, 403, 404, 410).forEach { code ->
+            assertThat(isAddressInvalidHttpCode(code)).isTrue()
+        }
+    }
+
+    @Test
+    fun `server errors and missing code do not invalidate the address`() {
+        listOf(500, 502, 503, 416, 200).forEach { code ->
+            assertThat(isAddressInvalidHttpCode(code)).isFalse()
+        }
+        assertThat(isAddressInvalidHttpCode(null)).isFalse()
+    }
+
+    @Test
+    fun `error detail names the recognizable network causes`() {
+        assertThat(IOException("x", SocketTimeoutException("timeout")).toPlaybackErrorDetail())
+            .isEqualTo("连接超时")
+        assertThat(IOException("x", UnknownHostException("cdn.example")).toPlaybackErrorDetail())
+            .isEqualTo("域名解析失败")
+        assertThat(IOException("x", ConnectException("refused")).toPlaybackErrorDetail())
+            .isEqualTo("连接失败")
+        assertThat(IOException("x", SSLHandshakeException("bad cert")).toPlaybackErrorDetail())
+            .isEqualTo("TLS 握手失败")
+    }
+
+    @Test
+    fun `error detail is null when cause is not recognizable`() {
+        assertThat(IOException("source error").toPlaybackErrorDetail()).isNull()
+        assertThat(IllegalStateException("boom").toPlaybackErrorDetail()).isNull()
+    }
+
+    @Test
+    fun `non http errors carry no request url or response code`() {
+        val error = IOException("source error", SocketTimeoutException("timeout"))
+
+        assertThat(error.failedRequestUrl()).isNull()
+        assertThat(error.httpResponseCode()).isNull()
     }
 
     /** 构造一个栈帧落在 media3 音频输出包内的异常。 */

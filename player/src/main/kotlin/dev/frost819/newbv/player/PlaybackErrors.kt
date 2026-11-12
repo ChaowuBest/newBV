@@ -1,7 +1,14 @@
 package dev.frost819.newbv.player
 
+import androidx.annotation.OptIn
 import androidx.media3.common.PlaybackException
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.HttpDataSource
 import java.io.IOException
+import java.net.ConnectException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
+import javax.net.ssl.SSLException
 
 /*
  * 播放错误分类与提示文案。
@@ -57,6 +64,9 @@ private const val AUDIO_PACKAGE_PREFIX = "androidx.media3.exoplayer.audio."
 
 /** 异常链最多回溯层数（防异常链成环）。 */
 private const val MAX_CAUSE_DEPTH = 8
+
+/** 表示「播放地址本身已失效」的 HTTP 状态码。 */
+private val ADDRESS_INVALID_HTTP_CODES = setOf(401, 403, 404, 410)
 
 /** 无法归类的播放错误的兜底提示。 */
 private const val FALLBACK_MESSAGE = "播放失败，请稍后重试"
@@ -133,6 +143,62 @@ internal fun isNetworkError(
 ): Boolean {
     if (errorCode != null && errorCode in NETWORK_ERROR_CODES) return true
     return throwable?.causeChain()?.any { it is IOException } == true
+}
+
+/**
+ * 是否由内存耗尽引起。
+ *
+ * media3 的加载线程遇到 `OutOfMemoryError` 时会把它包成 `UnexpectedLoaderException`
+ * （一个 [IOException]），表面上是「Source error」，实际与网络无关——换线路无济于事，
+ * 只能降低画质（码率）来减小缓冲占用。
+ */
+fun Throwable.isOutOfMemory(): Boolean = causeChain().any { it is OutOfMemoryError }
+
+/**
+ * 取出失败的那次 HTTP 请求的地址。
+ *
+ * media3 的 HTTP 数据源异常携带对应的 `DataSpec`，据此可以判断出错的是视频流还是音频流、
+ * 以及具体是哪个 CDN 节点。非 HTTP 层错误（解析、解码等）返回 null。
+ */
+@OptIn(UnstableApi::class)
+fun Throwable.failedRequestUrl(): String? =
+    causeChain()
+        .firstNotNullOfOrNull { (it as? HttpDataSource.HttpDataSourceException)?.dataSpec?.uri }
+        ?.toString()
+
+/**
+ * 取出失败请求的 HTTP 状态码；不是 HTTP 状态码错误时返回 null。
+ */
+@OptIn(UnstableApi::class)
+fun Throwable.httpResponseCode(): Int? =
+    causeChain().firstNotNullOfOrNull { (it as? HttpDataSource.InvalidResponseCodeException)?.responseCode }
+
+/**
+ * 是否为「播放地址本身已失效」的 HTTP 状态码（鉴权失败 / 资源不存在 / 已过期）。
+ *
+ * 同一批播放地址共用过期时间与签名，其中一个返回这类状态码时，同批的其它候选大概率
+ * 同样失效，应重新获取播放地址而不是继续轮换候选。
+ *
+ * @param code HTTP 状态码
+ */
+fun isAddressInvalidHttpCode(code: Int?): Boolean = code != null && code in ADDRESS_INVALID_HTTP_CODES
+
+/**
+ * 生成附在错误提示后的简短技术原因（如 `HTTP 403`、`连接超时`），便于用户反馈时定位。
+ *
+ * 只挑能稳定识别的几类；识别不出时返回 null，不展示无意义的类名。
+ */
+fun Throwable.toPlaybackErrorDetail(): String? {
+    httpResponseCode()?.let { return "HTTP $it" }
+    if (isOutOfMemory()) return "内存不足"
+    val chain = causeChain()
+    return when {
+        chain.any { it is SocketTimeoutException } -> "连接超时"
+        chain.any { it is UnknownHostException } -> "域名解析失败"
+        chain.any { it is ConnectException } -> "连接失败"
+        chain.any { it is SSLException } -> "TLS 握手失败"
+        else -> null
+    }
 }
 
 /**
